@@ -2,7 +2,7 @@ name: Camileri topla
 
 on:
   schedule:
-    - cron: '17 2 * * *'   # her gün 02:17 UTC; ay içinde veri tamamlanınca betik hemen çıkar
+    - cron: '17 2 * * *'   # her gün 02:17 UTC; o ayın verisi tamamsa betik hemen çıkar
   workflow_dispatch: {}     # Actions sekmesinden elle başlatmak için
 
 permissions:
@@ -15,22 +15,35 @@ concurrency:
 jobs:
   topla:
     runs-on: ubuntu-latest
-    timeout-minutes: 340    # betik 300. dakikada kendisi kaydedip çıkar
+    timeout-minutes: 340    # betik 300. dakikada kendisi durur
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Git ayarı
+      - name: osmium kur
+        run: sudo apt-get update -q && sudo apt-get install -y -q osmium-tool
+      - name: Ay
+        id: ay
+        run: echo "ay=$(date +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Biten bölgeleri geri yükle
+        uses: actions/cache/restore@v4
+        with:
+          path: parca
+          key: parca-${{ steps.ay.outputs.ay }}-${{ github.run_id }}
+          restore-keys: parca-${{ steps.ay.outputs.ay }}-
+      - name: Camileri topla
+        run: python scripts/topla.py
+      - name: Biten bölgeleri sakla
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: parca
+          key: parca-${{ steps.ay.outputs.ay }}-${{ github.run_id }}
+      - name: Kaydet
         run: |
           git config user.name "qibora-bot"
           git config user.email "miswakapp@gmail.com"
-      - name: Camileri topla
-        run: python scripts/topla.py
-      - name: Son kaydı yap
-        if: always()
-        run: |
-          git add -A t bilgi.json durum.json 2>/dev/null || true
+          git add -A t bilgi.json 2>/dev/null || true
           git commit -m "Cami verisi ($(date +%Y-%m-%d))" || echo "Değişiklik yok"
-          git pull --rebase -X ours || true
-          git push || true
+          git push
