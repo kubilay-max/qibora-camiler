@@ -1,5 +1,6 @@
 name: Camileri topla
 
+# Camiler (t/) ve helal yemek yerleri (h/)
 on:
   schedule:
     - cron: '17 2 * * *'   # her gün 02:17 UTC; o ayın verisi tamamsa betik hemen çıkar
@@ -29,21 +30,23 @@ jobs:
       - name: Biten bölgeleri geri yükle
         uses: actions/cache/restore@v4
         with:
-          path: parca
-          key: parca-${{ steps.ay.outputs.ay }}-${{ github.run_id }}
-          restore-keys: parca-${{ steps.ay.outputs.ay }}-
+          path: parca2
+          key: parca2-${{ steps.ay.outputs.ay }}-${{ github.run_id }}
+          restore-keys: parca2-${{ steps.ay.outputs.ay }}-
       - name: Camileri topla
         run: python scripts/topla.py
       - name: Biten bölgeleri sakla
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: parca
-          key: parca-${{ steps.ay.outputs.ay }}-${{ github.run_id }}
+          path: parca2
+          key: parca2-${{ steps.ay.outputs.ay }}-${{ github.run_id }}
       - name: Kaydet
         run: |
           git config user.name "qibora-bot"
           git config user.email "miswakapp@gmail.com"
-          git add -A t bilgi.json 2>/dev/null || true
+          git add -A t bilgi.json
+          if [ -d h ]; then git add -A h; fi
+          git rm -q --cached --ignore-unmatch durum.json
           git commit -m "Cami verisi ($(date +%Y-%m-%d))" || echo "Değişiklik yok"
           git push
