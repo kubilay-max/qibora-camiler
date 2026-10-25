@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dünyadaki camileri OpenStreetMap'ten toplar ve 1°×1° kare dosyalarına böler.
+Dünyadaki camileri ve helal yemek yerlerini OpenStreetMap'ten toplar, 1°×1° kare dosyalarına böler.
 
 Kaynak: Geofabrik'in bölge bölge hazır OSM dosyaları (download.geofabrik.de).
 Her bölge indirilir, osmium ile içinden "religion=muslim" olanlar ayıklanır, dosya silinir.
@@ -10,7 +10,9 @@ Biten bölgelerin sonuçları parca/ klasöründe tutulur (GitHub önbelleği il
 saklanır); süre biterse sonraki çalışma kaldığı yerden devam eder. Bütün bölgeler bitince
 t/ kareleri baştan yazılır.
 
-Çıktı: t/<enlem>_<boylam>.json  = [[enlem, boylam, "ad", {"dil": "ad"}], ...]
+Çıktı: t/<enlem>_<boylam>.json  = camiler: [[enlem, boylam, "ad", {"dil": "ad"}], ...]
+       h/<enlem>_<boylam>.json  = helal yerler: [[enlem, boylam, "ad", "tür", tamamen_helal(0/1), "mutfak", {"dil": "ad"}], ...]
+             tür: r=restoran f=fast food c=kafe k=kasap m=market p=fırın/pastane d=diğer
        bilgi.json              = son güncelleme bilgisi
 """
 import json, math, os, shutil, subprocess, sys, tempfile, threading, time, urllib.request
@@ -18,7 +20,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 KOK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CIKTI = os.path.join(KOK, 't')
-PARCA = os.path.join(KOK, 'parca')
+HCIKTI = os.path.join(KOK, 'h')
+PARCA = os.path.join(KOK, 'parca2')
+SURUM = 2  # veri biçimi değişince artır: o ay yeniden toplanır
 UA = 'QiboraMosqueTiles/3.0 (+https://kubilay-max.github.io/qibora/; miswakapp@gmail.com)'
 INDEKS = 'https://download.geofabrik.de/index-v1-nogeom.json'
 DILLER = ['en','tr','ar','id','ms','bn','ur','hi','fa','ps','ckb','ku','az','uz','kk','ky','tk','tg','ru','sq','bs',
@@ -54,8 +58,11 @@ def bolgeler():
     ozellik = [f['properties'] for f in j['features']]
     ebeveynler = {p.get('parent') for p in ozellik if p.get('parent')}
     liste = []
+    # ABD hem tek dosya hem eyalet dosyaları olarak var: eyaletler varsa tek dosyayı atla
+    eyalet = sum(1 for p in ozellik if '/north-america/us/' in p.get('urls', {}).get('pbf', ''))
+    atla = ATLA | ({'us'} if eyalet >= 40 else set())
     for p in ozellik:
-        if p['id'] in ebeveynler or p['id'] in ATLA or not p.get('urls', {}).get('pbf'):
+        if p['id'] in ebeveynler or p['id'] in atla or not p.get('urls', {}).get('pbf'):
             continue
         liste.append((p['id'], p['urls']['pbf']))
     return sorted(liste)
@@ -80,6 +87,27 @@ def merkez(geo):
         return None
     return sum(n[1] for n in noktalar) / len(noktalar), sum(n[0] for n in noktalar) / len(noktalar)
 
+YEMEK = {'restaurant': 'r', 'fast_food': 'f', 'cafe': 'c', 'food_court': 'r', 'ice_cream': 'c'}
+DUKKAN = {'butcher': 'k', 'supermarket': 'm', 'convenience': 'm', 'deli': 'm', 'greengrocer': 'm', 'grocery': 'm',
+          'frozen_food': 'm', 'bakery': 'p', 'confectionery': 'p', 'pastry': 'p'}
+
+def helal_durum(t):
+    """'only' = tamamen helal, 'yes' = helal seçenek var, None = belirtilmemiş / helal değil"""
+    for anahtar in ('diet:halal', 'halal'):
+        v = (t.get(anahtar) or '').strip().lower()
+        if v in ('only', 'yes'):
+            return v
+    return None
+
+def helal_tur(t):
+    if t.get('amenity') in YEMEK:
+        return YEMEK[t['amenity']]
+    if t.get('shop') in DUKKAN:
+        return DUKKAN[t['shop']]
+    if t.get('amenity') or t.get('shop') or t.get('craft') == 'caterer':
+        return 'd'
+    return None
+
 def bolge_isle(kimlik, url):
     hedef = os.path.join(PARCA, kimlik.replace('/', '_') + '.json')
     if os.path.exists(hedef):
@@ -93,7 +121,7 @@ def bolge_isle(kimlik, url):
         suzulmus = os.path.join(d, 's.osm.pbf')
         cikti = os.path.join(d, 's.geojsonseq')
         try:
-            subprocess.run(['osmium', 'tags-filter', pbf, 'nwr/religion=muslim', '-o', suzulmus, '--overwrite'],
+            subprocess.run(['osmium', 'tags-filter', pbf, 'nwr/religion=muslim', 'nwr/diet:halal', 'nwr/halal', '-o', suzulmus, '--overwrite'],
                            check=True)
             os.remove(pbf)
             subprocess.run(['osmium', 'export', suzulmus, '-f', 'geojsonseq', '-o', cikti, '--overwrite',
@@ -101,7 +129,7 @@ def bolge_isle(kimlik, url):
         except subprocess.CalledProcessError as x:
             log(f'   osmium hatası {kimlik}: {x}')
             return kimlik, None
-        sonuc = {}
+        sonuc, helal = {}, {}
         with open(cikti, encoding='utf-8') as f:
             for satir in f:
                 satir = satir.strip().lstrip('\x1e')
@@ -109,57 +137,77 @@ def bolge_isle(kimlik, url):
                     continue
                 o = json.loads(satir)
                 t = o.get('properties', {})
-                if t.get('amenity') != 'place_of_worship':
+                cami = t.get('amenity') == 'place_of_worship' and t.get('religion') == 'muslim'
+                hd = helal_durum(t)
+                tip = helal_tur(t) if hd else None
+                if not cami and not tip:
                     continue
                 m = merkez(o.get('geometry') or {})
                 if not m:
                     continue
                 anahtar = f"{str(t.get('@type', 'x'))[0]}{t.get('@id', '')}"
                 ad_dil = {dl: t[f'name:{dl}'] for dl in DILLER if t.get(f'name:{dl}')}
-                k = [round(m[0], 5), round(m[1], 5), t.get('name') or '']
-                if ad_dil:
-                    k.append(ad_dil)
-                sonuc[anahtar] = k
+                lat, lon = round(m[0], 5), round(m[1], 5)
+                if cami:
+                    k = [lat, lon, t.get('name') or '']
+                    if ad_dil:
+                        k.append(ad_dil)
+                    sonuc[anahtar] = k
+                if tip and t.get('name'):  # adı olmayan helal yer listede işe yaramaz
+                    mutfak = (t.get('cuisine') or '').split(';')[0].strip()[:24]
+                    k = [lat, lon, t['name'], tip, 1 if hd == 'only' else 0, mutfak]
+                    if ad_dil:
+                        k.append(ad_dil)
+                    helal[anahtar] = k
     gecici = hedef + '.tmp'
     with open(gecici, 'w', encoding='utf-8') as f:
-        json.dump(sonuc, f, ensure_ascii=False, separators=(',', ':'))
+        json.dump({'c': sonuc, 'h': helal}, f, ensure_ascii=False, separators=(',', ':'))
     os.replace(gecici, hedef)
-    return kimlik, f'{len(sonuc)} cami, {boyut:.0f} MB, {time.time() - t0:.0f} sn'
+    return kimlik, f'{len(sonuc)} cami, {len(helal)} helal, {boyut:.0f} MB, {time.time() - t0:.0f} sn'
 
 def kareleri_yaz():
-    hepsi = {}
+    camiler, helal = {}, {}
     for f in os.listdir(PARCA):
         if f.endswith('.json'):
             with open(os.path.join(PARCA, f), encoding='utf-8') as d:
-                hepsi.update(json.load(d))  # aynı cami iki bölgede varsa bir kez sayılır
-    kareler = {}
-    for k in hepsi.values():
-        kareler.setdefault(f'{math.floor(k[0])}_{math.floor(k[1])}', []).append(k)
-    if len(hepsi) < 50000:
-        log(f'UYARI: yalnızca {len(hepsi)} cami bulundu; kareler yazılmadı (bir şeyler ters gitmiş olabilir).')
+                p = json.load(d)
+            camiler.update(p['c'])  # aynı yer iki bölgede varsa bir kez sayılır
+            helal.update(p['h'])
+    if len(camiler) < 50000:
+        log(f'UYARI: yalnızca {len(camiler)} cami bulundu; kareler yazılmadı (bir şeyler ters gitmiş olabilir).')
         return False
-    os.makedirs(CIKTI, exist_ok=True)
-    for f in os.listdir(CIKTI):
+    kc = karelere_yaz(camiler, CIKTI)
+    kh = karelere_yaz(helal, HCIKTI)
+    with open(os.path.join(KOK, 'bilgi.json'), 'w') as f:
+        json.dump({'guncelleme': time.strftime('%Y-%m-%d'), 'kaynak': 'geofabrik', 'tamam': True, 'surum': SURUM,
+                   'cami': len(camiler), 'kare': kc, 'helal': len(helal), 'helal_kare': kh}, f, indent=1)
+    log(f'Bitti: {len(camiler)} cami ({kc} kare), {len(helal)} helal yer ({kh} kare) yazıldı.')
+    return True
+
+def karelere_yaz(kayitlar, klasor):
+    kareler = {}
+    for k in kayitlar.values():
+        kareler.setdefault(f'{math.floor(k[0])}_{math.floor(k[1])}', []).append(k)
+    os.makedirs(klasor, exist_ok=True)
+    for f in os.listdir(klasor):
         if f.endswith('.json') and f[:-5] not in kareler:
-            os.remove(os.path.join(CIKTI, f))
+            os.remove(os.path.join(klasor, f))
     for k, liste in kareler.items():
         liste.sort(key=lambda r: (r[0], r[1]))
-        with open(os.path.join(CIKTI, k + '.json'), 'w', encoding='utf-8') as f:
+        with open(os.path.join(klasor, k + '.json'), 'w', encoding='utf-8') as f:
             json.dump(liste, f, ensure_ascii=False, separators=(',', ':'))
-    with open(os.path.join(KOK, 'bilgi.json'), 'w') as f:
-        json.dump({'guncelleme': time.strftime('%Y-%m-%d'), 'kaynak': 'geofabrik', 'tamam': True,
-                   'cami': len(hepsi), 'kare': len(kareler)}, f, indent=1)
-    log(f'Bitti: {len(hepsi)} cami, {len(kareler)} kare yazıldı.')
-    return True
+    return len(kareler)
 
 def main():
     b = os.path.join(KOK, 'bilgi.json')
     if os.path.exists(b) and not os.environ.get('ZORLA'):
         with open(b) as f:
             bilgi = json.load(f)
-        if bilgi.get('tamam') and bilgi.get('guncelleme', '')[:7] == AY:
+        if bilgi.get('tamam') and bilgi.get('surum') == SURUM and bilgi.get('guncelleme', '')[:7] == AY:
             log(f'Bu ay ({AY}) veri zaten tamam; çıkılıyor.')
             return
+    if os.path.exists(os.path.join(KOK, 'durum.json')):
+        os.remove(os.path.join(KOK, 'durum.json'))  # eski sürümden kalan dosya
     os.makedirs(PARCA, exist_ok=True)
     liste = bolgeler()
     log(f'{len(liste)} bölge; {len(os.listdir(PARCA))} tanesi önbellekte.')
