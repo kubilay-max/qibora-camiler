@@ -1,7 +1,7 @@
 {
  "guncelleme": "2026-10-25",
- "kaynak": "overpass",
- "tamam": false,
- "cami": 0,
- "kare": 0
+ "kaynak": "geofabrik",
+ "tamam": true,
+ "cami": 292155,
+ "kare": 4277
 }
