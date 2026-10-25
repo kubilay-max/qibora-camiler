@@ -2,27 +2,35 @@ name: Camileri topla
 
 on:
   schedule:
-    - cron: '17 2 3 * *'
-  workflow_dispatch: {}
+    - cron: '17 2 * * *'   # her gün 02:17 UTC; ay içinde veri tamamlanınca betik hemen çıkar
+  workflow_dispatch: {}     # Actions sekmesinden elle başlatmak için
 
 permissions:
   contents: write
 
+concurrency:
+  group: camiler
+  cancel-in-progress: false
+
 jobs:
   topla:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 340    # betik 300. dakikada kendisi kaydedip çıkar
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Overpass'tan topla
-        run: python scripts/topla.py
-      - name: Değişiklikleri kaydet
+      - name: Git ayarı
         run: |
           git config user.name "qibora-bot"
           git config user.email "miswakapp@gmail.com"
-          git add -A t bilgi.json
-          git commit -m "Cami verisi güncellendi ($(date +%Y-%m-%d))" || echo "Değişiklik yok"
-          git push
+      - name: Camileri topla
+        run: python scripts/topla.py
+      - name: Son kaydı yap
+        if: always()
+        run: |
+          git add -A t bilgi.json durum.json 2>/dev/null || true
+          git commit -m "Cami verisi ($(date +%Y-%m-%d))" || echo "Değişiklik yok"
+          git pull --rebase -X ours || true
+          git push || true
